@@ -19,7 +19,6 @@ import skimage.io as io
 import PIL.Image
 
 import cog
-
 # import torch
 
 N = type(None)
@@ -38,15 +37,15 @@ TA = Union[T, ARRAY]
 
 WEIGHTS_PATHS = {
     "coco": "coco_weights.pt",
-    "conceptual-captions": "conceptual_weights.pt",
+    # "conceptual-captions": "conceptual_weights.pt",
 }
 
 D = torch.device
 CPU = torch.device("cpu")
 
 
-class Predictor(cog.Predictor):
-    def setup(self):
+class Predictor(cog.BasePredictor):
+    def setup(self, models_path: str = "models"):
         """Load the model into memory to make running multiple predictions efficient"""
         self.device = torch.device("cuda")
         self.clip_model, self.preprocess = clip.load(
@@ -58,40 +57,50 @@ class Predictor(cog.Predictor):
         self.prefix_length = 10
         for key, weights_path in WEIGHTS_PATHS.items():
             model = ClipCaptionModel(self.prefix_length)
-            model.load_state_dict(torch.load(weights_path, map_location=CPU))
+            model.load_state_dict(torch.load(os.path.join(models_path,weights_path), map_location=CPU), strict=False)
             model = model.eval()
             model = model.to(self.device)
             self.models[key] = model
 
-    @cog.input("image", type=cog.Path, help="Input image")
-    @cog.input(
-        "model",
-        type=str,
-        options=WEIGHTS_PATHS.keys(),
-        default="coco",
-        help="Model to use",
-    )
-    @cog.input(
-        "use_beam_search",
-        type=bool,
-        default=False,
-        help="Whether to apply beam search to generate the output text",
-    )
-    def predict(self, image, model, use_beam_search):
+    def predict(self, images: List[cog.Path]=[cog.Input("image", description="Input image")],
+                model:str = cog.Input(choices=WEIGHTS_PATHS.keys(), default="coco", description="Model to use"),
+                use_beam_search:bool = cog.Input(default=False, description="Whether to apply beam search to generate the output text")):
         """Run a single prediction on the model"""
-        image = io.imread(image)
         model = self.models[model]
-        pil_image = PIL.Image.fromarray(image)
-        image = self.preprocess(pil_image).unsqueeze(0).to(self.device)
+        
+        images_batch = []
+        for image in images:
+            if isinstance(image, str):
+                image = io.imread(image)
+            elif isinstance(image, np.ndarray):
+                pass
+            
+            pil_image = PIL.Image.fromarray(image)
+            image = self.preprocess(pil_image).unsqueeze(0).to(self.device)
+            # print('image',image.shape)
+            images_batch.append(image)
+        images_batch = torch.cat(images_batch, dim=0)
+        print('images_batch',images_batch.shape)
+        
         with torch.no_grad():
-            prefix = self.clip_model.encode_image(image).to(
+            prefix = self.clip_model.encode_image(images_batch).to(
                 self.device, dtype=torch.float32
             )
-            prefix_embed = model.clip_project(prefix).reshape(1, self.prefix_length, -1)
-        if use_beam_search:
-            return generate_beam(model, self.tokenizer, embed=prefix_embed)[0]
-        else:
-            return generate2(model, self.tokenizer, embed=prefix_embed)
+            print('prefix',prefix.shape)
+            prefix_embed = model.clip_project(prefix).reshape(images_batch.shape[0], self.prefix_length, -1)
+            print('prefix_embed',prefix_embed.shape)
+
+            #text prefix 
+
+        output = []
+        for i in range(prefix_embed.shape[0]):
+            
+            if use_beam_search:
+                output.append(generate_beam(model, self.tokenizer, embed=prefix_embed[i:i+1], prompt="The main object in the scene is ")[0])
+            else:
+                output.append(generate2(model, self.tokenizer, embed=prefix_embed[i:i+1],prompt="The main object in the scene is "))
+        return output
+        
 
 
 class MLP(nn.Module):
@@ -182,6 +191,12 @@ def generate_beam(
     with torch.no_grad():
         if embed is not None:
             generated = embed
+            if prompt is not None:
+                print('prompt',prompt)
+                text_tokens = torch.tensor(tokenizer.encode(prompt))
+                text_tokens = text_tokens.unsqueeze(0).to(device)
+                text_prompt = model.gpt.transformer.wte(text_tokens)
+                generated = torch.cat((generated,text_prompt), dim=1)
         else:
             if tokens is None:
                 tokens = torch.tensor(tokenizer.encode(prompt))
@@ -237,6 +252,7 @@ def generate_beam(
     return output_texts
 
 
+
 def generate2(
     model,
     tokenizer,
@@ -271,6 +287,8 @@ def generate2(
             for i in range(entry_length):
 
                 outputs = model.gpt(inputs_embeds=generated)
+                print('outputs',outputs)
+
                 logits = outputs.logits
                 logits = logits[:, -1, :] / (temperature if temperature > 0 else 1.0)
                 sorted_logits, sorted_indices = torch.sort(logits, descending=True)
